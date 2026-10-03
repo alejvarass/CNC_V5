@@ -237,7 +237,6 @@ struct MotionBlock {
   bool isJog;                  // N5: cancelable con 0x85
   bool isDwell;                // M1r: G4
   uint32_t dwellMs;
-  float lastExitSpeedMmS;      // A5: velocidad de salida registrada al encolar (diagnostico)
 };
 
 const int BLOCK_QUEUE_SIZE = 16;
@@ -1115,13 +1114,16 @@ static void plannerForwardPass() {
 
 // Pasada hacia atras sobre la cola: la velocidad de entrada de cada bloque debe
 // permitir frenar hasta la velocidad de entrada del siguiente (v^2 = v0^2 + 2ad).
-// A5: la pasada recorre TODA la cola, incluido el bloque de la cabeza (qTail),
-// que puede ser el que esta a punto de ejecutarse.
+// A1r/A5: la pasada se detiene ANTES de la cabeza (qTail): ese bloque puede
+// estar ya en ejecucion (popBlock trabaja sobre una copia) y no debe
+// modificarse. La coherencia de la union con la cabeza la garantiza la pasada
+// hacia adelante (plannerForwardPass), que si limita la entrada de cada bloque
+// nuevo segun la salida del que esta en la cola.
 // Debe llamarse con stateMutex tomado.
 static void plannerBackwardPass() {
   int idx = (qHead - 1 + BLOCK_QUEUE_SIZE) % BLOCK_QUEUE_SIZE;
   int next = -1;
-  for (;;) {
+  while (idx != qTail) {
     MotionBlock& b = blockQueue[idx];
     if (!b.active) break;
     if (next >= 0) {
@@ -1134,7 +1136,6 @@ static void plannerBackwardPass() {
         if (b.entrySpeedMmS > b.cruiseSpeedMmS) b.entrySpeedMmS = b.cruiseSpeedMmS;
       }
     }
-    if (idx == qTail) break; // la cabeza tambien se procesa (A5)
     next = idx;
     idx = (idx - 1 + BLOCK_QUEUE_SIZE) % BLOCK_QUEUE_SIZE;
   }
@@ -1244,7 +1245,6 @@ PlanResult planAndEnqueueBlock(float target[AXIS_COUNT], float feedMmPm,
                              blk.cruiseSpeedMmS, blk.accelMmS2);
     blk.entrySpeedMmS = min(vj, blk.cruiseSpeedMmS);
     prev.exitSpeedMmS = blk.entrySpeedMmS; // la union manda en ambos extremos
-    prev.lastExitSpeedMmS = prev.exitSpeedMmS; // A1r: referencia para 0x85
   } else {
     blk.entrySpeedMmS = min(ax[dominantAxis].scurve.startSpeedMmS, blk.cruiseSpeedMmS);
   }
@@ -1252,12 +1252,11 @@ PlanResult planAndEnqueueBlock(float target[AXIS_COUNT], float feedMmPm,
   blk.exitSpeedMmS = min(ax[dominantAxis].scurve.endSpeedMmS, blk.cruiseSpeedMmS);
 
   blk.active = true;
-  blk.lastExitSpeedMmS = blk.exitSpeedMmS;
   for (int i = 0; i < AXIS_COUNT; i++) plannedPos[i] = target[i];
   qHead = nextHead;
 
   plannerBackwardPass(); // A5: garantiza el frenado hasta el siguiente bloque
-  plannerForwardPass();  // A5: la entrada del nuevo bloque puede bajar tras la pasada atras
+  plannerForwardPass();  // A5: limita la entrada del nuevo bloque tras la pasada atras
   xSemaphoreGive(stateMutex);
   return PLAN_OK;
 }
@@ -1496,7 +1495,8 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
   float iVal = 0.0f, jVal = 0.0f;
   bool badLine = false;
   bool g53Line = false;         // G53: este movimiento ignora el WCO (MPos)
-  bool lWordSeen = false;       // G10 L20 (P ignorado: un solo sistema de trabajo)
+  bool lWordSeen = false;       // G10/G92 con palabra L
+  int lWord = -1;               // valor de L (-1 = ausente)
 
   char* p = line;
   char w; float val;
@@ -1543,7 +1543,7 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
       case 'I': iVal = gcode_is_inches ? val * 25.4f : val; hasI = true; break;
       case 'J': jVal = gcode_is_inches ? val * 25.4f : val; hasJ = true; break;
       case 'P': dwellSec = val; break;
-      case 'L': lWordSeen = true; break; // G10 L20: aceptado
+      case 'L': lWordSeen = true; lWord = (int)val; break; // G10/G92 L-word
       case 'F': gcode_feed_rate_mmpm = val; break;
       case 'T': case 'S': break; // herramienta/spindle: aceptados sin efecto
       case 'N': break;           // numero de linea: ignorado
@@ -1555,9 +1555,15 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
   if (badLine) { client.print("error:Invalid gcode\r\n"); return true; }
 
   if (wcoLine) {
-    // N6/N13: G92 sin palabra L valida solo acepta L0/L20 (o ausente); G10 exige L20
-    bool isG92 = (wcoLine && !lWordSeen);
-    (void)isG92;
+    // N6/N13: solo se soporta fijar el cero de trabajo actual:
+    //   - G92 (sin L) o G92 L0/L20
+    //   - G10 L20 (P se ignora: un solo sistema de trabajo)
+    // Cualquier otro L (L1/L2: tool offset / offset de sistema de coordenadas)
+    // se RECHAZA en lugar de aplicar una semantica distinta a la pedida.
+    if (lWordSeen && lWord != 0 && lWord != 20) {
+      client.print("error:Unsupported command\r\n");
+      return true;
+    }
     forceStatusPush = true;
     client.print("ok\r\n");
     return true;

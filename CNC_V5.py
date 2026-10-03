@@ -3,9 +3,15 @@ import socket
 from datetime import datetime
 import math
 import json
+import logging
 import cv2
 
 from PySide6.QtCore import Qt, QThread, Signal, QPointF, QRectF, QTimer
+
+# M5: logging de excepciones (nada de 'except: pass' en silencio)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("CNC_V5")
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPainterPath, QImage
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -136,7 +142,13 @@ class CameraMeasurementWidget(QWidget):
     def stop_camera(self):
         if self.cam_worker:
             self.cam_worker.stop()
-            self.cam_worker.wait(500)
+            # M5: esperar la salida real del hilo antes de liberarlo (el
+            # timeout evita un bloqueo permanente si el driver no responde)
+            if self.cam_worker.isRunning():
+                if not self.cam_worker.wait(2000):
+                    log.warning("El hilo de camara no termino en 2000 ms; se solicita terminacion")
+                    self.cam_worker.terminate()
+                    self.cam_worker.wait(500)
             self.cam_worker = None
         self.cam_opening = False
         self.raw_frame = None
@@ -576,11 +588,12 @@ class TcpWorker(QThread):
             self._close_socket()
 
     def _parse_line(self, line: str):
-        # M5: parseo tolerante; una linea corrupta nunca tumba el hilo
+        # M5: parseo tolerante; una linea corrupta nunca tumba el hilo,
+        # pero la excepcion queda registrada (nada de silencio total)
         try:
             self._parse_line_inner(line)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Linea de telemetria no parseable: %r (%s)", line[:120], e)
 
     def _parse_line_inner(self, line: str):
         if line.startswith("<") and line.endswith(">"):
@@ -633,6 +646,12 @@ class TcpWorker(QThread):
                         axd["backlash_mm"] = float(f[25])
                         axd["max_speed_mm_s"] = float(f[26])
                         axd["accel_mm_s2"] = float(f[27])
+                    # Campo V5.1 opcional: WCO (offset de trabajo; WPos = pos - wco)
+                    if len(f) >= 29:
+                        try:
+                            axd["wco"] = float(f[28])
+                        except ValueError:
+                            pass
                     payload["axes"][axes_names[i]] = axd
             self.parsed_msg.emit({"type": "status", "payload": payload})
         elif tag == "ACK":
@@ -668,7 +687,8 @@ class TcpWorker(QThread):
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
                 self.sock.close()
-            except Exception: pass
+            except Exception as e:
+                log.debug("Cierre de socket con aviso (esperado si ya estaba cerrado): %s", e)
             self.sock = None
 
 
@@ -953,7 +973,14 @@ class AxisBlock(QGroupBox):
             self.lbl_lpos_val.setText(f"{self.last_start_pos:.3f}")
         self.was_moving = is_moving
 
-        self.lbl_pos_num.setText(f"{pos:.3f} mm")
+        # N16: si el firmware envia wco (V5.1+), la Pos mostrada es la de
+        # TRABAJO (WPos = MPos - wco), unificada con el modo GRBL; si no, se
+        # muestra la posicion de maquina como antes (compatibilidad).
+        wco = d.get("wco", None)
+        wpos = round(pos - wco, 3) if wco is not None else pos
+        if abs(wpos) < 0.0005:
+            wpos = 0.000
+        self.lbl_pos_num.setText(f"{wpos:.3f} mm")
         self.lbl_woff.setText(f"{max_travel:.3f}")
         self.lbl_dir.setText(direction if is_moving else "STOP")
         self.lbl_dir.setStyleSheet("color: #58a6ff; font-weight: bold; font-size: 14px;" if is_moving else "color: #8b949e; font-weight: bold; font-size: 14px;")
@@ -1718,6 +1745,7 @@ class GCodeRunnerWidget(QWidget):
     linea a linea (espera 'ok' correlacionado, aborta ante 'error:')."""
 
     MAX_LINE_MS = 300000  # arcos largos tardan en encolarse: watchdog generoso
+    MAX_QUEUE_FULL_RETRIES = 400  # N22: ~40 s a 100 ms esperando hueco de cola
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
@@ -1727,10 +1755,15 @@ class GCodeRunnerWidget(QWidget):
         self.is_running = False
         self.paused = False
         self.waiting_ok = False
+        self._queue_full_retries = 0
 
         self.watchdog = QTimer(self)
         self.watchdog.setSingleShot(True)
         self.watchdog.timeout.connect(self._on_timeout)
+
+        self.retry_timer = QTimer(self)  # N22: reintento ante Queue full
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self._retry_line)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 6, 6, 6)
@@ -1826,18 +1859,27 @@ class GCodeRunnerWidget(QWidget):
         if not self.paused and self.is_running and not self.waiting_ok:
             self._send_next()
 
-    def _stop(self):
+    def _stop(self, abort: bool = False):
         was = self.is_running
         self.is_running = False
         self.paused = False
         self.waiting_ok = False
+        self._queue_full_retries = 0
         self.watchdog.stop()
+        self.retry_timer.stop()
         self.btn_run.setEnabled(bool(self.lines))
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.lbl_status.setText("Detenido.")
         if was:
-            self.main_window.send_compact("!")  # parada inmediata (tiempo real)
+            if abort:
+                # Parada inmediata (tiempo real): deshabilita drivers
+                self.main_window.send_compact("!")
+            else:
+                # N22: DETENER del cargador = feed hold suave: purga la cola
+                # (0x85 cancela los bloques pendientes) SIN deshabilitar los
+                # drivers; la maquina queda energizada y lista para reanudar.
+                self.main_window.send_compact("\x85")
 
     def _send_next(self):
         if not self.is_running or self.paused or self.waiting_ok:
@@ -1860,20 +1902,40 @@ class GCodeRunnerWidget(QWidget):
     def notify_ack(self, ok: bool, detail: str):
         if not self.is_running or not self.waiting_ok:
             return
+        # N22: "Queue full" no es fatal: con el ok diferido del firmware V5.1
+        # no deberia ocurrir, pero ante un firmware V5.0 (o cola saturada) el
+        # cargador REINTENTA la misma linea tras 100 ms en lugar de abortar.
+        det = str(detail)
+        if not ok and ("queue full" in det.lower() or det.strip().endswith("|FULL")):
+            if self._queue_full_retries < self.MAX_QUEUE_FULL_RETRIES:
+                self._queue_full_retries += 1
+                self.lbl_status.setText(f"Cola llena: reintento {self._queue_full_retries} (línea {self.idx + 1})")
+                self.watchdog.stop()
+                self.retry_timer.start(100)
+                return
         self.watchdog.stop()
         self.waiting_ok = False
+        self._queue_full_retries = 0
         if ok:
             self.idx += 1
             self._send_next()
         else:
             line_no = self.idx + 1
-            self._stop()
+            self._stop(abort=True)
             QMessageBox.critical(self, "G-code", f"Error en línea {line_no}: {detail}")
+
+    def _retry_line(self):
+        # N22: reenviar la linea actual (waiting_ok sigue en True)
+        if not self.is_running or self.paused:
+            self.waiting_ok = False
+            return
+        self.watchdog.start(self.MAX_LINE_MS)
+        self.main_window.send_compact(self.lines[self.idx])
 
     def _on_timeout(self):
         if self.is_running:
             line_no = self.idx + 1
-            self._stop()
+            self._stop(abort=True)
             QMessageBox.critical(self, "G-code", f"Tiempo agotado esperando 'ok' en línea {line_no}.")
 
 
@@ -1919,6 +1981,15 @@ class MainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self.poll_status)
 
+        # N21: heartbeat dedicado en AMBOS modos mientras haya conexion.
+        # En modo compacto el firmware empuja ST cada 60 ms, pero su watchdog
+        # (C3, 3000 ms) exige que el cliente HABLE: sin heartbeat, cualquier
+        # movimiento compacto > 3 s disparaba "Comm Timeout". 250 ms (4 Hz) da
+        # un margen de 12x sobre el timeout con trafico despreciable (~100 B/s)
+        # y sobrevive a rafagas de telemetria que podrian retrasar un envio.
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.timeout.connect(self._send_heartbeat)
+
         self._deadman_timer = QTimer(self)
         self._deadman_timer.timeout.connect(self._send_deadman_ping)
 
@@ -1937,6 +2008,8 @@ class MainWindow(QMainWindow):
     def _set_initial_disconnected_ui(self):
         if self._poll_timer.isActive():
             self._poll_timer.stop()
+        if self._heartbeat_timer.isActive():
+            self._heartbeat_timer.stop()
         if self._deadman_timer.isActive():
             self._deadman_timer.stop()
 
@@ -2355,22 +2428,44 @@ class MainWindow(QMainWindow):
         if not self._deadman_timer.isActive():
             self._deadman_timer.start(70)
 
+    def _grbl_jog_feed_mmpm(self, axis: str) -> float:
+        # N26: feed de jog derivado de la velocidad configurada (jog_us =
+        # periodo de paso en us) y de los steps/mm del eje: v = 1e6/(jog_us*spm)
+        try:
+            jog_us = max(80.0, float(self.axis_tabs[axis].sp_jog_us.value()))
+            spm = float(self.last_status.get("axes", {}).get(axis, {}).get("steps_per_mm", 568.0))
+            if spm < 0.1:
+                spm = 568.0
+            v_mm_s = 1e6 / (jog_us * spm)
+            v_mm_s = min(max(v_mm_s, 0.5), 50.0)
+            return v_mm_s * 60.0
+        except Exception:
+            return 600.0
+
     def _send_grbl_jog_step(self, axis: str, dir_cmd: str):
         # N5: tramo corto acotado al soft limit restante; al soltar, 0x85 lo
         # cancela en el firmware sin deshabilitar los actuadores.
+        # N26: no saturar la cola: si ya hay >= 6 bloques pendientes, este tick
+        # no envia nada (el firmware sigue drenando los tramos anteriores).
+        qd = self.last_status.get("queue_depth", -1)
+        if isinstance(qd, int) and qd >= 6:
+            return
         try:
             cur_pos = float(self.last_status.get("axes", {}).get(axis, {}).get("pos", 0.0))
             max_travel = float(self.axis_tabs[axis].sp_max_travel.value())
         except Exception:
             cur_pos, max_travel = 0.0, 110.0
-        step = 2.0
+        feed = self._grbl_jog_feed_mmpm(axis)
+        # N26: tramo proporcional al feed para un movimiento fluido (~0.3 s por
+        # tramo), acotado entre 0.5 y 4 mm
+        step = min(max(feed / 60.0 * 0.3, 0.5), 4.0)
         if dir_cmd == "forward":
             dist = min(step, max(0.0, max_travel - cur_pos - 0.1))
         else:
             dist = -min(step, max(0.0, cur_pos - 0.1))
         if abs(dist) < 0.05:
             return
-        self.send_compact(f"$J=G91 G21 {axis.upper()}{dist:.3f} F600")
+        self.send_compact(f"$J=G91 G21 {axis.upper()}{dist:.3f} F{feed:.0f}")
 
     def _dpad_release_direction(self, group: str, direction: str):
         self._dpad_active = False
@@ -2485,8 +2580,11 @@ class MainWindow(QMainWindow):
         # M8: pedir version de firmware
         self.send_compact("GET_VERSION")
         self.poll_status()
+        # N21: heartbeat en ambos modos (el watchdog C3 del firmware lo exige)
+        if not self._heartbeat_timer.isActive():
+            self._heartbeat_timer.start(250)
         # M5: en modo compacto el firmware ya empuja telemetria cada 60 ms;
-        # el polling solo se mantiene para el modo GRBL ('?')
+        # el polling de estado solo se mantiene para el modo GRBL ('?')
         if self.use_grbl_protocol:
             self._poll_timer.start(100)
         self._update_controls_interlock()
@@ -2548,7 +2646,7 @@ class MainWindow(QMainWindow):
         if self.sequence_widget.is_running:
             self.sequence_widget._stop_sequence()
         if self.gcode_widget.is_running:
-            self.gcode_widget._stop()
+            self.gcode_widget._stop(abort=True)  # E-stop global: corte inmediato
         self._update_controls_interlock()
 
     def _send_estop(self):
@@ -2644,6 +2742,13 @@ class MainWindow(QMainWindow):
             self.send_compact("GET_STATUS")
         else:
             self.send_compact("?")
+
+    def _send_heartbeat(self):
+        # N21: heartbeat en AMBOS modos mientras haya conexion (evita el
+        # "Comm Timeout" del firmware en movimientos compactos largos).
+        if not (self.worker and self.worker.running):
+            return
+        self.poll_status()
 
     def _check_target_inside_soft_limit_for_axis(self, axis_name: str, target: float):
         try:
@@ -2817,7 +2922,8 @@ class MainWindow(QMainWindow):
                 if st_ack in ("LIMIT", "NOT_HOMED", "REJECTED", "INVALID") and cmd_ack not in ("grbl_error",):
                     self.lbl_machine_state_v.setText(f"{cmd_ack}:{st_ack}")
                     self._set_label_color_state(self.lbl_machine_state_v, "yellow")
-        except Exception: pass
+        except Exception as e:
+            log.error("Error procesando mensaje del firmware: %s", e, exc_info=True)
 
     def closeEvent(self, event):
         self._user_disconnect = True
@@ -2825,19 +2931,22 @@ class MainWindow(QMainWindow):
         self._estop_timer.stop()
         if self._poll_timer.isActive():
             self._poll_timer.stop()
+        if self._heartbeat_timer.isActive():
+            self._heartbeat_timer.stop()
         if self._deadman_timer.isActive():
             self._deadman_timer.stop()
         if self.sequence_widget.is_running:
             self.sequence_widget._stop_sequence()
         if self.gcode_widget.is_running:
-            self.gcode_widget._stop()
+            self.gcode_widget._stop(abort=True)  # cierre de la app: corte inmediato
         self._dpad_release_group("xy")
         self._dpad_release_group("zw")
         if self.cam_widget:
             self.cam_widget.stop_camera()
         try:
             if self.worker: self.worker.stop(); self.worker.wait(200)
-        except Exception: pass
+        except Exception as e:
+            log.warning("Aviso al detener el hilo de red durante el cierre: %s", e)
         event.accept()
 
 
