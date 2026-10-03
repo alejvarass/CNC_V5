@@ -64,8 +64,8 @@ La **V5.1** corrige los defectos críticos, altos y la mayoría de los medios id
 - **Rearmado:** `$X` y `enable_actuators` solo re-energizan si el E-stop está liberado (`!estopActive()`).
 - **Recomendación de hardware (C2r):** para corte de potencia real, cablear el E-stop en serie con la alimentación de los drivers (el ISR solo corta ENABLE).
 
-### 3.2 Salida de ALARM (N12 — corregido)
-`clearAlarmState()` purga la cola, cancela solicitudes pendientes de homing/movimiento y resincroniza `plannedPos` con la posición real. Si la purga no puede completarse (mutex ocupado), **no se desbloquea** (fail-safe) y la tarea de motores finaliza la purga de forma diferida.
+### 3.2 Salida de ALARM y re-energizado (N12 — corregido)
+`clearAlarmState()` purga la cola, cancela solicitudes pendientes de homing/movimiento y resincroniza `plannedPos` con la posición real. Se invoca **incondicionalmente** al desbloquear/re-energizar (`$X` y `enable_actuators` por TCP y serial), no solo en ALARM: así un soft-stop que dejara bloques activos nunca los reanuda de forma obsoleta. Si la purga no puede completarse (mutex ocupado), **no se habilita** (fail-safe) y la tarea de motores finaliza la purga de forma diferida.
 
 ### 3.3 Soft limits y validación (C1r, N6)
 - Límites siempre activos (con o sin referencia); ejes sin referenciar devuelven `NOT_HOMED`.
