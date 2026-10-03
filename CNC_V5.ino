@@ -17,7 +17,8 @@
  *  N13 G10/G92/set_zero_axis fijan el WCO contra plannedPos (final de cola).
  *  N25 arcos con espera de hueco extendida y telemetria durante la espera,
  *      validacion de error de radio (tolerancia GRBL 0.5 mm) y G53 aceptado.
- *  N6  NaN/Inf rechazados en inLim y en el planificador (isfinite).
+ *  N6  NaN/Inf rechazados: inLim (isfinite) bloquea cualquier objetivo no
+ *      finito en el planificador; G4 valida su parametro P.
  *  N14 $J absoluto aplica el WCO (consistente con G1).
  *  N16 la telemetria compacta incluye wco (campo 28); la UI muestra WPos.
  *  N17 reset_step_counter y set_calibration_axis invalidan homed: exigen
@@ -1299,8 +1300,11 @@ static bool waitQueueSpace(WiFiClient& client, uint32_t timeoutMs) {
     }
     if (machineState == ALARM) return false;
     refreshAllInputs();
-    if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    // N25/A1r: respetar tambien forceStatusPush (un cambio de estado durante la
+    // espera no debe quedar enmascarado hasta que venza el intervalo)
+    if (forceStatusPush || (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)) {
       lastTelemetryMs = millis();
+      forceStatusPush = false;
       sendCompactStatus(client); // N25: la UI sigue viva durante arcos largos
     }
     delay(2);
@@ -1737,9 +1741,11 @@ void parseCompactLine(WiFiClient& client, char* line) {
       client.print("ACK|enable_actuators|REJECTED\n");
       return;
     }
-    // N12: salir de ALARM purga cola y solicitudes pendientes y resincroniza
-    // plannedPos; si la purga no se logra, no se desbloquea (fail-safe).
-    if (machineState == ALARM && !clearAlarmState()) {
+    // N12: re-energizar SIEMPRE deja la maquina en estado conocido: purga cola
+    // y solicitudes pendientes y resincroniza plannedPos (no solo en ALARM: un
+    // soft-stop pudo dejar bloques activos). Si la purga no se logra, no se
+    // habilita (fail-safe).
+    if (!clearAlarmState()) {
       client.print("ACK|enable_actuators|FAIL\n");
       return;
     }
@@ -2157,8 +2163,9 @@ void parseSerialCommand(char* line) {
       Serial.println("ACK|enable_actuators|REJECTED");
       return;
     }
-    // N12: misma politica que por TCP: purga total al salir de ALARM
-    if (machineState == ALARM && !clearAlarmState()) {
+    // N12: misma politica que por TCP: purga total al re-energizar (no solo en
+    // ALARM), para no reanudar bloques obsoletos. Fail-safe si no se logra.
+    if (!clearAlarmState()) {
       Serial.println("ACK|enable_actuators|FAIL");
       return;
     }
