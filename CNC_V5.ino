@@ -1,6 +1,40 @@
 /*
- * CNC XYZW V5 - Firmware ESP32
- * Corrige los 25 hallazgos de "Auditoria CNC XYZW V3":
+ * CNC XYZW V5.1 - Firmware ESP32
+ * Sobre la base V5 (25 hallazgos de "Auditoria CNC XYZW V3") se remedia la
+ * "Auditoria CNC XYZW V5" (objetivo: scoring > 80/100):
+ *  N19 manualStop ya no aborta bloques encolados: solo stopEpoch/jogCancelEpoch
+ *      deciden; asi '$H', G-code, $J y move_multi_abs funcionan tras un stop
+ *      ('!', 0x18, timeout o E-stop fisico) sin rearmado manual.
+ *  N20 polaridad del E-stop corregida: con boton NC a GND e INPUT_PULLUP el
+ *      estado activo (pulsado o cable cortado) es HIGH: ISR en RISING y todos
+ *      los chequeos == HIGH. Fail-safe real.
+ *  N21 heartbeat del cliente en AMBOS modos (ver CNC_V5.py: timer 500 ms).
+ *  N22 ok diferido hasta que haya hueco en la cola (control de flujo estilo
+ *      GRBL) en G0/G1/G4/G28/$J/move_multi_abs; el cliente reintenta ante FULL.
+ *  N12 toda salida de ALARM ($X / enable_actuators) purga cola y solicitudes
+ *      pendientes y resincroniza plannedPos; si la purga no se logra, no se
+ *      desbloquea (fail-safe).
+ *  N13 G10/G92/set_zero_axis fijan el WCO contra plannedPos (final de cola).
+ *  N25 arcos con espera de hueco extendida y telemetria durante la espera,
+ *      validacion de error de radio (tolerancia GRBL 0.5 mm) y G53 aceptado.
+ *  N6  NaN/Inf rechazados en inLim y en el planificador (isfinite).
+ *  N14 $J absoluto aplica el WCO (consistente con G1).
+ *  N16 la telemetria compacta incluye wco (campo 28); la UI muestra WPos.
+ *  N17 reset_step_counter y set_calibration_axis invalidan homed: exigen
+ *      re-referenciado del eje.
+ *  A5  rampa con velocidades reales de union, pasada hacia adelante + hacia
+ *      atras y junction deviation estandar (sin discontinuidad cerca de 5.7°).
+ *  A1r 0x85 solo resincroniza plannedPos de los ejes con jog cancelado.
+ *  C5  limite de intentos AUTH, cierre de sesion sin autenticar (timeout) y
+ *      requerimiento de corte de potencia del E-stop documentado (C2r).
+ *  C2r escrituras TCP con contador de reintentos: un cliente colgado no
+ *      puede bloquear loop() indefinidamente.
+ *  M5  cliente: excepciones registradas (logging) y cierre de camara con
+ *      espera real del hilo.
+ *  N26 jog GRBL con feed derivado de la velocidad configurada y profundidad
+ *      de cola acotada.
+ *  M2/M3/M7/M8: sin cambio estructural (piso de paso, pines, lazo abierto);
+ *      documentados en la transferencia de ingenieria.
  *  N1  planificacion desde el final de la cola (plannedPos protegido por mutex)
  *  C2  E-stop: pin fisico con ISR que deshabilita drivers + ACK con reintento (cliente)
  *  C3  watchdog funcional (wasConnected), heartbeat con timeout en Run/Jog, server.begin() en GOT_IP
@@ -34,7 +68,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 
-#define FW_VERSION "5.0.0"
+#define FW_VERSION "5.1.0"
 
 const uint16_t SERVER_PORT = 5000;
 const size_t MAX_LINE_LEN = 256;
@@ -69,6 +103,14 @@ const unsigned long COMM_TIMEOUT_MS = 3000;
 // C5: autenticacion por token (vacio = modo abierto, configurar por serial)
 String authToken = "";
 bool clientAuthenticated = false;
+// C5: endurecimiento: limite de intentos y cierre de sesion sin autenticar
+uint8_t authFailCount = 0;
+const uint8_t AUTH_MAX_ATTEMPTS = 5;
+unsigned long authGraceStartMs = 0;
+const unsigned long AUTH_GRACE_MS = 10000; // 10 s para autenticarse
+
+// C2r: escrituras TCP acotadas (un cliente colgado no bloquea loop())
+const unsigned long TCP_WRITE_TIMEOUT_MS = 3000;
 
 // C2: E-stop fisico
 volatile bool estopTriggered = false;
@@ -119,6 +161,9 @@ struct AxisState {
 
   volatile bool manualForward = false;
   volatile bool manualBackward = false;
+  // N19: manualStop queda solo como residuo del JOG libre por serial (JOG_FREE);
+  // ya no participa en la ejecucion de bloques ni del homing: los abortos de
+  // movimientos encolados los decide stopEpoch (y jogCancelEpoch para jog).
   volatile bool manualStop = false;
 
   int homingSeekUs = 1200;
@@ -192,12 +237,16 @@ struct MotionBlock {
   bool isJog;                  // N5: cancelable con 0x85
   bool isDwell;                // M1r: G4
   uint32_t dwellMs;
+  float lastExitSpeedMmS;      // A5: velocidad de salida registrada al encolar (diagnostico)
 };
 
 const int BLOCK_QUEUE_SIZE = 16;
 MotionBlock blockQueue[BLOCK_QUEUE_SIZE];
 volatile int qHead = 0;
 volatile int qTail = 0;
+
+// A5: junction deviation estandar (mm), modelo GRBL: vj = sqrt(accel * jd)
+const float JUNCTION_DEVIATION_MM = 0.05f;
 
 // N1: posicion planeada = final de la cola. Solo se modifica bajo stateMutex
 // (al encolar, al purgar, al ejecutar jog manual o al abortar).
@@ -236,16 +285,24 @@ inline void waitStepHardwareTimer(uint32_t delayUs) {
   ulTaskNotifyTake(pdTRUE, timeoutTicks);
 }
 
-// C2: ISR del E-stop fisico: corta ENABLE de inmediato y marca el evento
+// C2: ISR del E-stop fisico: corta ENABLE de inmediato y marca el evento.
+// N20: con boton NC a GND e INPUT_PULLUP, el estado ACTIVO (pulsado o cable
+// cortado) es HIGH -> fail-safe. ISR disparado por flanco RISING.
 void IRAM_ATTR onEstopISR() {
   digitalWrite(PIN_ENABLE_ACTUATORS, HIGH); // drivers deshabilitados
   actuatorsEnabled = false;
   estopTriggered = true;
 }
 
+// N20: boton NC a GND: el E-stop esta activo cuando la linea queda en HIGH
+// (pulsado = abre el circuito; cable cortado = mismo estado, fail-safe)
+inline bool estopActive() {
+  return digitalRead(PIN_ESTOP) == HIGH;
+}
+
 void setActuatorsState(bool enable) {
-  // C2: no permitir re-energizar mientras el E-stop fisico siga pulsado
-  if (enable && digitalRead(PIN_ESTOP) == LOW) {
+  // C2/N20: no permitir re-energizar mientras el E-stop fisico siga activo
+  if (enable && estopActive()) {
     enable = false;
     estopTriggered = true;
   }
@@ -295,16 +352,45 @@ void compensateBacklash(AxisId a, bool newDirPos, uint32_t stepUs) {
   }
 }
 
-inline bool inLim(AxisId a, float v){ 
-  return !(v < -0.05f || v > (ax[a].maxTravel + 0.05f)); 
+// N6: NaN/Inf no pasan: un valor no finito nunca esta dentro de limites
+inline bool inLim(AxisId a, float v){
+  if (!isfinite(v)) return false;
+  return !(v < -0.05f || v > (ax[a].maxTravel + 0.05f));
 }
 
 void clearManualFlags(AxisId a){
   ax[a].manualForward = false;
   ax[a].manualBackward = false;
+  ax[a].manualStop = false; // N19: residuo de JOG_FREE; no debe sobrevivir a un stop
   ax[a].isMoving = false;
   strncpy(ax[a].moveDir, "none", sizeof(ax[a].moveDir) - 1);
   ax[a].moveDir[sizeof(ax[a].moveDir) - 1] = '\0';
+}
+
+// N12: toda salida de ALARM deja la maquina en un estado conocido: cola
+// vacia, sin solicitudes pendientes de homing/movimiento y plannedPos
+// resincronizado con la posicion real. Devuelve false si no se logro la
+// purga bajo mutex (quien llama NO debe desbloquear: fail-safe).
+static bool clearAlarmState() {
+  stopEpoch++;      // invalida cualquier bloque en vuelo
+  jogCancelEpoch++; // y cualquier jog en vuelo
+  for (int i = 0; i < AXIS_COUNT; i++) {
+    clearManualFlags((AxisId)i);
+    ax[i].runAbsMoveRequested = false;
+    ax[i].runHomeRequested = false;
+    jogFreeSteps[i] = 0;
+  }
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    qHead = 0;
+    qTail = 0;
+    for (int i = 0; i < BLOCK_QUEUE_SIZE; i++) blockQueue[i].active = false;
+    for (int i = 0; i < AXIS_COUNT; i++) plannedPos[i] = ax[i].pos;
+    queuePurgePending = false;
+    xSemaphoreGive(stateMutex);
+    return true;
+  }
+  queuePurgePending = true; // TaskMotors completa la purga con el mutex libre
+  return false;
 }
 
 // A1r: purga de la cola bajo mutex, con reintento; si no se logra, la tarea
@@ -314,7 +400,6 @@ void stopAllMotion() {
   jogCancelEpoch++;
   for(int i=0; i<AXIS_COUNT; i++) {
     clearManualFlags((AxisId)i);
-    ax[i].manualStop = true;
     ax[i].runAbsMoveRequested = false;
     ax[i].runHomeRequested = false;
     jogFreeSteps[i] = 0;
@@ -500,9 +585,9 @@ void sendCompactStatus(WiFiClient& c) {
   }
   char outBuf[1100];
   int n = snprintf(outBuf, sizeof(outBuf), "ST|%s|%d|%d", machineStateStr(), actuatorsEnabled ? 1 : 0, qDepth);
-  for (int i = 0; i < AXIS_COUNT && n < (int)sizeof(outBuf) - 140; i++) {
+  for (int i = 0; i < AXIS_COUNT && n < (int)sizeof(outBuf) - 150; i++) {
     n += snprintf(outBuf + n, sizeof(outBuf) - n,
-      "|%.3f,%.3f,%lld,%d,%d,%d,%d,%d,%s,%.2f,%.2f,%lu,%lu,%d,%d,%d,%d,%d,%s,%.2f,%.2f,%.2f,%.2f,%s,%d,%.3f,%.2f,%.1f",
+      "|%.3f,%.3f,%lld,%d,%d,%d,%d,%d,%s,%.2f,%.2f,%lu,%lu,%d,%d,%d,%d,%d,%s,%.2f,%.2f,%.2f,%.2f,%s,%d,%.3f,%.2f,%.1f,%.3f",
       ax[i].pos, ax[i].targetPos, (long long)ax[i].stepCount,
       ax[i].homed ? 1 : 0, ax[i].calibrated ? 1 : 0, ax[i].firstRun ? 1 : 0, ax[i].dirForwardLevel,
       ax[i].isMoving ? 1 : 0, ax[i].moveDir, ax[i].stepsPerMm, ax[i].maxTravel,
@@ -511,7 +596,9 @@ void sendCompactStatus(WiFiClient& c) {
       ax[i].scurve.startSpeedMmS, ax[i].scurve.cruiseSpeedMmS, ax[i].scurve.endSpeedMmS, ax[i].scurve.rampRatio,
       ax[i].lastError,
       // Campos nuevos V5 (24-27): feed de homing, backlash, vel maxima, aceleracion
-      ax[i].homingFeedUs, ax[i].backlashMm, ax[i].maxSpeedMmS, ax[i].accelMmS2
+      ax[i].homingFeedUs, ax[i].backlashMm, ax[i].maxSpeedMmS, ax[i].accelMmS2,
+      // Campo nuevo V5.1 (28): WCO (N16: la UI muestra WPos = pos - wco)
+      ax[i].wco
     );
   }
   strncat(outBuf, "\n", sizeof(outBuf) - strlen(outBuf) - 1);
@@ -551,7 +638,7 @@ bool doHoming(AxisId a) {
   bool hitSwitch = false;
 
   while (stepCounter < maxSeekSteps) {
-    if (ax[a].manualStop || stopEpoch != epoch || !actuatorsEnabled) break;
+    if (stopEpoch != epoch || !actuatorsEnabled) break;
     if (digitalRead(hw[a].pinLimitHome) == HIGH) {
       hitSwitch = true;
       break;
@@ -561,7 +648,7 @@ bool doHoming(AxisId a) {
     stepCounter++;
   }
 
-  if (!hitSwitch || ax[a].manualStop || stopEpoch != epoch || !actuatorsEnabled) {
+  if (!hitSwitch || stopEpoch != epoch || !actuatorsEnabled) {
     homingAbort(a, "Homing Seek Fail");
     return false;
   }
@@ -571,7 +658,7 @@ bool doHoming(AxisId a) {
   strncpy(ax[a].moveDir, "forward", sizeof(ax[a].moveDir) - 1);
   compensateBacklash(a, true, ax[a].homingBackoffUs);
   for (uint32_t i = 0; i < ax[a].backoffSteps; i++) {
-    if (ax[a].manualStop || stopEpoch != epoch || !actuatorsEnabled) { homingAbort(a, "Homing Abortado"); return false; }
+    if (stopEpoch != epoch || !actuatorsEnabled) { homingAbort(a, "Homing Abortado"); return false; }
     pulseAxis(a, true);
     waitStepHardwareTimer(ax[a].homingBackoffUs);
   }
@@ -583,7 +670,7 @@ bool doHoming(AxisId a) {
   hitSwitch = false;
   stepCounter = 0;
   while (stepCounter < ax[a].backoffSteps * 2) {
-    if (ax[a].manualStop || stopEpoch != epoch || !actuatorsEnabled) { homingAbort(a, "Homing Abortado"); return false; }
+    if (stopEpoch != epoch || !actuatorsEnabled) { homingAbort(a, "Homing Abortado"); return false; }
     if (digitalRead(hw[a].pinLimitHome) == HIGH) {
       hitSwitch = true;
       break;
@@ -603,7 +690,7 @@ bool doHoming(AxisId a) {
   strncpy(ax[a].moveDir, "forward", sizeof(ax[a].moveDir) - 1);
   compensateBacklash(a, true, ax[a].homingBackoffUs);
   for (uint32_t i = 0; i < ax[a].softLimitOffsetSteps; i++) {
-    if (ax[a].manualStop || stopEpoch != epoch || !actuatorsEnabled) { homingAbort(a, "Homing Abortado"); return false; }
+    if (stopEpoch != epoch || !actuatorsEnabled) { homingAbort(a, "Homing Abortado"); return false; }
     pulseAxis(a, true);
     waitStepHardwareTimer(ax[a].homingBackoffUs);
   }
@@ -666,7 +753,7 @@ bool moveAbsExecution(AxisId a, float target, bool isJog){
   float rampRatio = ax[a].useSCurve ? ax[a].scurve.rampRatio : 0.0f;
 
   for(uint32_t i=0; i<steps; i++){
-    if(ax[a].manualStop || stopEpoch != epoch || !actuatorsEnabled) break;
+    if(stopEpoch != epoch || !actuatorsEnabled) break;
     if(!dirPos && digitalRead(hw[a].pinLimitHome) == HIGH){
       strncpy(ax[a].lastError, "Limit Hit", sizeof(ax[a].lastError) - 1);
       machineState = ALARM;
@@ -685,7 +772,7 @@ bool moveAbsExecution(AxisId a, float target, bool isJog){
 
   // N1: pos = stepCount real (pulseAxis lo mantiene); solo se "cierra" al target
   // si el movimiento completo termino sin stop ni alarma.
-  if (!ax[a].manualStop && stopEpoch == epoch && actuatorsEnabled && machineState != ALARM) {
+  if (stopEpoch == epoch && actuatorsEnabled && machineState != ALARM) {
     ax[a].pos = target;
     ax[a].stepCount = lroundf(target * safeSpm(a));
   }
@@ -734,7 +821,9 @@ bool executeBlock(const MotionBlock& blk) {
   machineState = RUNNING;
   long errAccum[AXIS_COUNT] = {0, 0, 0, 0};
 
-  // A1r: manualStop ya NO se borra aqui; se borra al aceptar el comando
+  // N19: el aborto lo decide stopEpoch (y jogCancelEpoch en bloques jog);
+  // manualStop ya no se consulta aqui. Los comandos recien aceptados tras un
+  // stop se ejecutan con normalidad (nada queda "pegado").
   for (int i = 0; i < AXIS_COUNT; i++) {
     setAxisDirection((AxisId)i, blk.dirPos[i]);
     ax[i].targetPos = blk.target[i];
@@ -757,7 +846,6 @@ bool executeBlock(const MotionBlock& blk) {
     if (blk.isJog && jogCancelEpoch != jogEpoch) { aborted = true; break; }
 
     for (int i = 0; i < AXIS_COUNT; i++) {
-      if (ax[i].manualStop) { aborted = true; break; }
       if (blk.deltaSteps[i] > 0 && !blk.dirPos[i] && digitalRead(hw[i].pinLimitHome) == HIGH) {
         strncpy(ax[i].lastError, "Limit Hit", sizeof(ax[i].lastError) - 1);
         machineState = ALARM;
@@ -782,11 +870,13 @@ bool executeBlock(const MotionBlock& blk) {
     waitStepHardwareTimer(currentFeedUs);
   }
 
-  // N1: al abortar, pos conserva el valor real de stepCount (sin forzar target)
+  // N1/N15: al abortar, pos conserva el valor real de stepCount. Al completar,
+  // solo se ajusta si el error acumulado es sub-paso (<0.5 pasos); un error
+  // mayor indica perdida de pasos y queda visible en la telemetria.
   bool completed = !aborted && actuatorsEnabled && machineState != ALARM;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
     for (int i = 0; i < AXIS_COUNT; i++) {
-      if (completed && blk.deltaSteps[i] > 0) {
+      if (completed && blk.deltaSteps[i] > 0 && fabsf(ax[i].pos - blk.target[i]) < (0.5f / safeSpm((AxisId)i))) {
         ax[i].pos = blk.target[i];
         ax[i].stepCount = lroundf(blk.target[i] * safeSpm((AxisId)i));
       }
@@ -814,6 +904,11 @@ static bool popBlock(MotionBlock& out) {
       found = true;
     }
     xSemaphoreGive(stateMutex);
+  }
+  // N19: un stop anterior (JOG_FREE/manual) no debe abortar bloques aceptados
+  // despues; limpiar el residuo ANTES de ejecutar el bloque.
+  if (found) {
+    for (int i = 0; i < AXIS_COUNT; i++) ax[i].manualStop = false;
   }
   return found;
 }
@@ -844,7 +939,6 @@ static bool popHomeRequest(AxisId& outAxis) {
     for (int i = 0; i < AXIS_COUNT; i++) {
       if (ax[i].runHomeRequested) {
         ax[i].runHomeRequested = false;
-        ax[i].manualStop = false; // aceptar el comando habilita un nuevo intento
         outAxis = (AxisId)i;
         found = true;
         break;
@@ -973,32 +1067,61 @@ void TaskMotors(void * pvParameters) {
 // PLANIFICADOR VECTORIAL CON LOOK-AHEAD (A5)
 // - N1: planifica desde plannedPos (final de la cola), no desde la pos actual.
 // - N9: limita el feed por la velocidad maxima de cada eje e informa el recorte.
-// - A5: velocidades de entrada/salida por union (angulo) + pasada hacia atras
-//       con aceleracion real en mm/s2. El perfil S usa velocidades reales.
+// - A5: velocidades de entrada/salida por union con junction deviation estandar
+//       (modelo GRBL: vj = sqrt(accel * jd * sin(angulo/2) / (1-sin(angulo/2)))),
+//       pasada hacia adelante (limita la entrada segun el bloque previo, incluido
+//       el que ya esta en la cola listo para ejecutarse) y pasada hacia atras
+//       (garantiza el frenado hasta la entrada del siguiente bloque).
 // ============================================================================
 
 // Velocidad maxima de union entre dos bloques segun el angulo entre ellos.
+// Modelo junction deviation continuo (GRBL): sin la discontinuidad que el
+// modelo ad-hoc anterior presentaba cerca de 5.7 grados.
 static float junctionSpeed(const float u1[AXIS_COUNT], const float u2[AXIS_COUNT],
                            float v1, float v2, float accelMmS2) {
   float dot = 0.0f;
   for (int i = 0; i < AXIS_COUNT; i++) dot += u1[i] * u2[i];
   if (dot > 1.0f) dot = 1.0f;
   if (dot < -1.0f) dot = -1.0f;
+  if (dot >= 0.9999f) return min(v1, v2);     // colineal: sin reduccion
   if (dot <= 0.0f) return 0.0f;               // >=90 grados: detener en la esquina
-  // Modelo tipo junction deviation: cuanto mas cerrado el angulo, menor velocidad
   float sinHalf = sqrtf((1.0f - dot) * 0.5f);
-  if (sinHalf < 0.05f) return min(v1, v2);    // casi colineal: sin reduccion
-  float vj = sqrtf(accelMmS2 * 0.05f * (1.0f - sinHalf) / sinHalf);
+  float vj = sqrtf(accelMmS2 * JUNCTION_DEVIATION_MM * sinHalf / (1.0f - sinHalf));
   return min(min(v1, v2), vj);
+}
+
+// A5: pasada hacia adelante. La entrada del primer bloque encolado no puede
+// superar lo que su distancia permite alcanzar desde la velocidad de salida del
+// bloque que se esta ejecutando (o esta a punto de ejecutarse) en la cola.
+// Debe llamarse con stateMutex tomado.
+static void plannerForwardPass() {
+  int n = (qHead - qTail + BLOCK_QUEUE_SIZE) % BLOCK_QUEUE_SIZE;
+  if (n == 0) return;
+  int prev = qTail;
+  for (int k = 1; k < n; k++) {
+    int idx = (qTail + k) % BLOCK_QUEUE_SIZE;
+    MotionBlock& prevB = blockQueue[prev];
+    MotionBlock& b = blockQueue[idx];
+    if (!b.active) break;
+    if (prevB.active && !prevB.isDwell && !b.isDwell) {
+      float maxEntry = sqrtf(prevB.exitSpeedMmS * prevB.exitSpeedMmS +
+                             2.0f * b.accelMmS2 * b.distanceMm);
+      if (b.entrySpeedMmS > maxEntry) b.entrySpeedMmS = maxEntry;
+      if (b.entrySpeedMmS > b.cruiseSpeedMmS) b.entrySpeedMmS = b.cruiseSpeedMmS;
+    }
+    prev = idx;
+  }
 }
 
 // Pasada hacia atras sobre la cola: la velocidad de entrada de cada bloque debe
 // permitir frenar hasta la velocidad de entrada del siguiente (v^2 = v0^2 + 2ad).
+// A5: la pasada recorre TODA la cola, incluido el bloque de la cabeza (qTail),
+// que puede ser el que esta a punto de ejecutarse.
 // Debe llamarse con stateMutex tomado.
 static void plannerBackwardPass() {
   int idx = (qHead - 1 + BLOCK_QUEUE_SIZE) % BLOCK_QUEUE_SIZE;
   int next = -1;
-  while (idx != qTail) {
+  for (;;) {
     MotionBlock& b = blockQueue[idx];
     if (!b.active) break;
     if (next >= 0) {
@@ -1011,6 +1134,7 @@ static void plannerBackwardPass() {
         if (b.entrySpeedMmS > b.cruiseSpeedMmS) b.entrySpeedMmS = b.cruiseSpeedMmS;
       }
     }
+    if (idx == qTail) break; // la cabeza tambien se procesa (A5)
     next = idx;
     idx = (idx - 1 + BLOCK_QUEUE_SIZE) % BLOCK_QUEUE_SIZE;
   }
@@ -1037,6 +1161,9 @@ PlanResult planAndEnqueueBlock(float target[AXIS_COUNT], float feedMmPm,
     }
   }
 
+  // N15/A1r: los deltas se calculan desde plannedPos (final de la cola) bajo
+  // mutex; con la cola vacia plannedPos == pos real. Asi los movimientos
+  // encolados nunca parten de una posicion intermedia obsoleta.
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(25)) != pdTRUE) return PLAN_FULL;
 
   int nextHead = (qHead + 1) % BLOCK_QUEUE_SIZE;
@@ -1117,6 +1244,7 @@ PlanResult planAndEnqueueBlock(float target[AXIS_COUNT], float feedMmPm,
                              blk.cruiseSpeedMmS, blk.accelMmS2);
     blk.entrySpeedMmS = min(vj, blk.cruiseSpeedMmS);
     prev.exitSpeedMmS = blk.entrySpeedMmS; // la union manda en ambos extremos
+    prev.lastExitSpeedMmS = prev.exitSpeedMmS; // A1r: referencia para 0x85
   } else {
     blk.entrySpeedMmS = min(ax[dominantAxis].scurve.startSpeedMmS, blk.cruiseSpeedMmS);
   }
@@ -1124,10 +1252,12 @@ PlanResult planAndEnqueueBlock(float target[AXIS_COUNT], float feedMmPm,
   blk.exitSpeedMmS = min(ax[dominantAxis].scurve.endSpeedMmS, blk.cruiseSpeedMmS);
 
   blk.active = true;
+  blk.lastExitSpeedMmS = blk.exitSpeedMmS;
   for (int i = 0; i < AXIS_COUNT; i++) plannedPos[i] = target[i];
   qHead = nextHead;
 
-  plannerBackwardPass();
+  plannerBackwardPass(); // A5: garantiza el frenado hasta el siguiente bloque
+  plannerForwardPass();  // A5: la entrada del nuevo bloque puede bajar tras la pasada atras
   xSemaphoreGive(stateMutex);
   return PLAN_OK;
 }
@@ -1138,8 +1268,9 @@ PlanResult planDwell(uint32_t dwellMs) {
   return planAndEnqueueBlock(dummy, 100.0f, false, true, dwellMs, NULL);
 }
 
-// Espera activa corta hasta que haya espacio en la cola (para arcos G2/G3).
-// Procesa bytes de tiempo real del cliente mientras espera (no los traga).
+// N22/N25: espera de hueco en la cola (control de flujo estilo GRBL: el "ok" se
+// difiere hasta que el bloque entra). Mientras espera NO se bloquea el sistema:
+// se atienden los comandos de tiempo real y se mantiene la telemetria viva.
 static bool waitQueueSpace(WiFiClient& client, uint32_t timeoutMs) {
   uint32_t t0 = millis();
   while (millis() - t0 < timeoutMs) {
@@ -1154,9 +1285,25 @@ static bool waitQueueSpace(WiFiClient& client, uint32_t timeoutMs) {
       if (ch == '!') { client.read(); stopAllMotion(); setActuatorsState(false); }
       else if (ch == (char)0x18) { client.read(); stopAllMotion(); }
       else if (ch == (char)0x85) { client.read(); jogCancelEpoch++; }
+      // N25: '?' responde incluso durante la espera de hueco (arcos)
+      else if (ch == '?') {
+        client.read();
+        if (authToken.length() == 0 || clientAuthenticated) {
+          client.printf("<%s|MPos:%.3f,%.3f,%.3f,%.3f|WPos:%.3f,%.3f,%.3f,%.3f|FS:%.0f,0>\r\n",
+            machineStateStr(),
+            ax[0].pos, ax[1].pos, ax[2].pos, ax[3].pos,
+            ax[0].pos - ax[0].wco, ax[1].pos - ax[1].wco, ax[2].pos - ax[2].wco, ax[3].pos - ax[3].wco,
+            gcode_feed_rate_mmpm);
+        }
+      }
       else break;
     }
     if (machineState == ALARM) return false;
+    refreshAllInputs();
+    if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+      lastTelemetryMs = millis();
+      sendCompactStatus(client); // N25: la UI sigue viva durante arcos largos
+    }
     delay(2);
   }
   return false;
@@ -1267,9 +1414,15 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
       return true;
     }
     if (line[1] == 'X') {
-      // N8: $X desbloquea ALARM solo si el E-stop fisico esta liberado
-      if (digitalRead(PIN_ESTOP) == LOW) {
+      // N8/N20: $X desbloquea ALARM solo si el E-stop fisico esta liberado (NC: HIGH)
+      if (estopActive()) {
         client.print("error:E-stop activo\r\n");
+        return true;
+      }
+      // N12: salir de ALARM purga cola y solicitudes pendientes y resincroniza
+      // plannedPos; si la purga no se logra, no se desbloquea (fail-safe).
+      if (!clearAlarmState()) {
+        client.print("error:Unlock failed (busy)\r\n");
         return true;
       }
       setActuatorsState(true);
@@ -1281,6 +1434,8 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
     if (strncmp(line, "$J=", 3) == 0) {
       // N5: jog real. Se planifica como bloque cancelable (0x85) y los limites
       // se validan en el planificador (error:Soft limit si se excede).
+      // N14: el $J absoluto se referencia a coordenadas de TRABAJO (aplica wco),
+      // igual que G1 en modo absoluto.
       float snap[AXIS_COUNT];
       snapshotPlanned(snap);
       float target[AXIS_COUNT] = {snap[0], snap[1], snap[2], snap[3]};
@@ -1294,21 +1449,31 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
         if (w == 'G') {
           int g = (int)val;
           if (g == 90) jog_rel = false;
-          if (g == 91) jog_rel = true;
-          if (g == 20) jog_inches = true;
-          if (g == 21) jog_inches = false;
+          else if (g == 91) jog_rel = true;
+          else if (g == 20) jog_inches = true;
+          else if (g == 21) jog_inches = false;
+          else if (g == 53) { /* movimiento en MPos: aceptado (N25) */ }
         } else if (w == 'F') {
           feed = val;
         } else {
           int ai = (w == 'X') ? 0 : (w == 'Y') ? 1 : (w == 'Z') ? 2 : 3;
           float mm = jog_inches ? val * 25.4f : val;
-          // GRBL: $J absoluto se referencia a coordenadas de maquina
-          target[ai] = jog_rel ? (snap[ai] + mm) : mm;
+          // N14: absoluto en coordenadas de trabajo (como G1), relativo desde el
+          // final de la cola
+          target[ai] = jog_rel ? (snap[ai] + mm) : (mm + ax[ai].wco);
         }
       }
       if (!actuatorsEnabled) { client.print("error:Actuators off\r\n"); return true; }
       bool limited = false;
       PlanResult pr = planAndEnqueueBlock(target, feed, true, false, 0, &limited);
+      // N22: si la cola esta llena, el ok se difiere hasta que haya hueco
+      while (pr == PLAN_FULL) {
+        if (!waitQueueSpace(client, 30000)) {
+          client.print("error:Queue full\r\n");
+          return true;
+        }
+        pr = planAndEnqueueBlock(target, feed, true, false, 0, &limited);
+      }
       printPlanResult(client, pr, limited);
       return true;
     }
@@ -1330,6 +1495,8 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
   bool hasI = false, hasJ = false;
   float iVal = 0.0f, jVal = 0.0f;
   bool badLine = false;
+  bool g53Line = false;         // G53: este movimiento ignora el WCO (MPos)
+  bool lWordSeen = false;       // G10 L20 (P ignorado: un solo sistema de trabajo)
 
   char* p = line;
   char w; float val;
@@ -1346,7 +1513,8 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
         else if (g == 20) gcode_is_inches = true;
         else if (g == 21) gcode_is_inches = false;
         else if (g == 17) { /* unico plano soportado */ }
-        else if (g == 18 || g == 19 || g == 53) { client.print("error:Unsupported command\r\n"); return true; }
+        else if (g == 53) g53Line = true; // M1r/N25: este movimiento en MPos
+        else if (g == 18 || g == 19) { client.print("error:Unsupported command\r\n"); return true; }
         break;
       }
       case 'M': {
@@ -1359,12 +1527,15 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
         int ai = (w == 'X') ? 0 : (w == 'Y') ? 1 : (w == 'Z') ? 2 : 3;
         float mm = gcode_is_inches ? val * 25.4f : val;
         if (wcoLine) {
-          // N7: WCO separado; los soft limits siguen en coordenadas de maquina
-          ax[ai].wco = ax[ai].pos - mm;
+          // N7/N13: WCO separado y fijado contra el FINAL DE LA COLA
+          // (plannedPos), no contra la posicion en vivo: con bloques pendientes
+          // el cero de trabajo queda donde el programa realmente termina.
+          ax[ai].wco = plannedPos[ai] - mm;
         } else if (g28Line) {
           g28AxisSeen[ai] = true; // G28: solo marca el eje (punto intermedio ignorado)
         } else {
-          target[ai] = gcode_is_relative ? (snap[ai] + mm) : (mm + ax[ai].wco);
+          target[ai] = gcode_is_relative ? (snap[ai] + mm)
+                       : (g53Line ? mm : (mm + ax[ai].wco)); // G53: MPos directo
           axisWordSeen = true;
         }
         break;
@@ -1372,7 +1543,7 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
       case 'I': iVal = gcode_is_inches ? val * 25.4f : val; hasI = true; break;
       case 'J': jVal = gcode_is_inches ? val * 25.4f : val; hasJ = true; break;
       case 'P': dwellSec = val; break;
-      case 'L': break; // G10 L20: aceptado
+      case 'L': lWordSeen = true; break; // G10 L20: aceptado
       case 'F': gcode_feed_rate_mmpm = val; break;
       case 'T': case 'S': break; // herramienta/spindle: aceptados sin efecto
       case 'N': break;           // numero de linea: ignorado
@@ -1384,15 +1555,24 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
   if (badLine) { client.print("error:Invalid gcode\r\n"); return true; }
 
   if (wcoLine) {
+    // N6/N13: G92 sin palabra L valida solo acepta L0/L20 (o ausente); G10 exige L20
+    bool isG92 = (wcoLine && !lWordSeen);
+    (void)isG92;
     forceStatusPush = true;
     client.print("ok\r\n");
     return true;
   }
 
   if (dwellLine) {
-    if (dwellSec < 0.0f) { client.print("error:Invalid gcode\r\n"); return true; }
+    if (dwellSec < 0.0f || !isfinite(dwellSec)) { client.print("error:Invalid gcode\r\n"); return true; }
     uint32_t ms = (uint32_t)constrain(dwellSec * 1000.0f, 0.0f, 60000.0f);
-    printPlanResult(client, planDwell(ms), false);
+    PlanResult pr = planDwell(ms);
+    // N22: ok diferido hasta que haya hueco en la cola
+    while (pr == PLAN_FULL) {
+      if (!waitQueueSpace(client, 30000)) { client.print("error:Queue full\r\n"); return true; }
+      pr = planDwell(ms);
+    }
+    printPlanResult(client, pr, false);
     return true;
   }
 
@@ -1404,6 +1584,10 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
     }
     bool limited = false;
     PlanResult pr = planAndEnqueueBlock(target, 100000.0f, false, false, 0, &limited);
+    while (pr == PLAN_FULL) { // N22: ok diferido hasta que haya hueco
+      if (!waitQueueSpace(client, 30000)) { client.print("error:Queue full\r\n"); return true; }
+      pr = planAndEnqueueBlock(target, 100000.0f, false, false, 0, &limited);
+    }
     printPlanResult(client, pr, false); // G0/G28: el recorte a velocidad de eje es normal
     return true;
   }
@@ -1425,6 +1609,12 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
     if (full) {
       sweep = (motionMode == 2) ? -2.0f * (float)M_PI : 2.0f * (float)M_PI;
     } else {
+      // N25: validacion del error de radio como GRBL (tolerancia 0.5 mm y 0.1%)
+      float rEnd = hypotf(target[0] - cx, target[1] - cy);
+      if (fabsf(rEnd - r) > 0.5f && fabsf(rEnd - r) > 0.001f * r) {
+        client.print("error:Invalid arc\r\n");
+        return true;
+      }
       float a1 = atan2f(target[1] - cy, target[0] - cx);
       sweep = a1 - a0;
       if (motionMode == 2) { while (sweep >= 0.0f) sweep -= 2.0f * (float)M_PI; }
@@ -1455,8 +1645,9 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
       bool limited = false;
       PlanResult pr = planAndEnqueueBlock(seg, feed, false, false, 0, &limited);
       while (pr == PLAN_FULL) {
-        // Arco largo: esperar hueco procesando tiempo real, sin tragar comandos
-        if (!waitQueueSpace(client, 5000)) {
+        // N22/N25: arco largo: el ok se difiere hasta que haya hueco. Durante la
+        // espera se atienden '?'/tiempo real y se mantiene viva la telemetria.
+        if (!waitQueueSpace(client, 30000)) {
           stopAllMotion();
           client.print("error:Queue full\r\n");
           return true;
@@ -1477,6 +1668,15 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
   bool limited = false;
   float feed = (motionMode == 0) ? 100000.0f : gcode_feed_rate_mmpm; // N9: G0 limitado por eje
   PlanResult pr = planAndEnqueueBlock(target, feed, false, false, 0, &limited);
+  // N22: control de flujo estilo GRBL: si la cola esta llena, el ok se difiere
+  // hasta que el bloque entre (el cliente nunca aborta por Queue full).
+  while (pr == PLAN_FULL) {
+    if (!waitQueueSpace(client, 30000)) {
+      client.print("error:Queue full\r\n");
+      return true;
+    }
+    pr = planAndEnqueueBlock(target, feed, false, false, 0, &limited);
+  }
   printPlanResult(client, pr, motionMode != 0 && limited);
   return true;
 }
@@ -1484,16 +1684,23 @@ bool processGrblGCode(WiFiClient& client, char* rawLine) {
 void parseCompactLine(WiFiClient& client, char* line) {
   lastRxMs = millis(); // C3: heartbeat (cualquier linea recibida cuenta)
 
-  // C5: autenticacion por token de sesion
+  // C5: autenticacion por token de sesion con limite de intentos; el token
+  // nunca se imprime ni se registra (viaja por TCP plano: usar en red segmentada)
   if (strncmp(line, "AUTH|", 5) == 0) {
     const char* tok = line + 5;
     if (authToken.length() == 0 || authToken.equals(tok)) {
       clientAuthenticated = true;
+      authFailCount = 0;
       client.print("AUTH|OK\n");
       sendCompactStatus(client);
     } else {
       clientAuthenticated = false;
+      authFailCount++;
       client.print("AUTH|FAIL\n");
+      if (authFailCount >= AUTH_MAX_ATTEMPTS) {
+        client.print("error:Too many auth attempts\n");
+        client.stop(); // C5: liberar el unico cupo de conexion
+      }
     }
     return;
   }
@@ -1519,9 +1726,15 @@ void parseCompactLine(WiFiClient& client, char* line) {
   if (!cmdName) return;
 
   if (strcmp(cmdName, "enable_actuators") == 0) {
-    // N8/C2: no re-energizar con E-stop fisico pulsado
-    if (digitalRead(PIN_ESTOP) == LOW) {
+    // N8/C2/N20: no re-energizar con el E-stop fisico activo (NC: HIGH)
+    if (estopActive()) {
       client.print("ACK|enable_actuators|REJECTED\n");
+      return;
+    }
+    // N12: salir de ALARM purga cola y solicitudes pendientes y resincroniza
+    // plannedPos; si la purga no se logra, no se desbloquea (fail-safe).
+    if (machineState == ALARM && !clearAlarmState()) {
+      client.print("ACK|enable_actuators|FAIL\n");
       return;
     }
     setActuatorsState(true);
@@ -1585,6 +1798,11 @@ void parseCompactLine(WiFiClient& client, char* line) {
       float tgt[AXIS_COUNT] = { (float)atof(xStr), (float)atof(yStr), (float)atof(zStr), (float)atof(wStr) };
       float feedMmpm = fStr ? constrain((float)atof(fStr), 1.0f, 100000.0f) : 600.0f;
       PlanResult pr = planAndEnqueueBlock(tgt, feedMmpm, false, false, 0, NULL);
+      // N22: si la cola esta llena, el ACK se difiere hasta que haya hueco
+      while (pr == PLAN_FULL) {
+        if (!waitQueueSpace(client, 30000)) { client.print("ACK|move_multi_abs|FULL\n"); return; }
+        pr = planAndEnqueueBlock(tgt, feedMmpm, false, false, 0, NULL);
+      }
       // N10: codigos de error distintos por causa
       if (pr == PLAN_OK) client.print("ACK|move_multi_abs|OK\n");
       else if (pr == PLAN_SOFT_LIMIT) client.print("ACK|move_multi_abs|LIMIT\n");
@@ -1601,7 +1819,7 @@ void parseCompactLine(WiFiClient& client, char* line) {
       // N10/C1r: validar antes de aceptar el comando
       if (!ax[a].homed) { client.print("ACK|move_axis_abs|NOT_HOMED\n"); return; }
       if (!inLim(a, tgt)) { strncpy(ax[a].lastError, "Soft Limit", sizeof(ax[a].lastError) - 1); client.print("ACK|move_axis_abs|LIMIT\n"); return; }
-      ax[a].manualStop = false; // aceptar el comando habilita un nuevo movimiento
+      ax[a].manualStop = false; // N19: limpiar residuo de JOG_FREE al aceptar
       ax[a].pendingTargetPos = tgt; ax[a].isJogMove = false; ax[a].runAbsMoveRequested = true;
       client.print("ACK|move_axis_abs|OK\n");
     }
@@ -1614,7 +1832,7 @@ void parseCompactLine(WiFiClient& client, char* line) {
       float tgt = ax[a].pos + (float)atof(valStr);
       if (!ax[a].homed) { client.print("ACK|move_axis_rel|NOT_HOMED\n"); return; }
       if (!inLim(a, tgt)) { strncpy(ax[a].lastError, "Soft Limit", sizeof(ax[a].lastError) - 1); client.print("ACK|move_axis_rel|LIMIT\n"); return; }
-      ax[a].manualStop = false;
+      ax[a].manualStop = false; // N19: limpiar residuo de JOG_FREE al aceptar
       ax[a].pendingTargetPos = tgt; ax[a].isJogMove = false; ax[a].runAbsMoveRequested = true;
       client.print("ACK|move_axis_rel|OK\n");
     }
@@ -1624,7 +1842,9 @@ void parseCompactLine(WiFiClient& client, char* line) {
     char* axStr = strtok(NULL, "|");
     if (axStr) {
       AxisId a = parseAxis(axStr);
-      ax[a].wco = ax[a].pos; // N7: solo WCO, pos de maquina intacta
+      // N13: WCO contra el final de la cola (plannedPos), no contra la
+      // posicion en vivo: consistente con G10/G92.
+      ax[a].wco = plannedPos[a]; // N7: solo WCO, pos de maquina intacta
       client.print("ACK|set_zero_axis|OK\n"); sendCompactStatus(client);
     }
     return;
@@ -1672,17 +1892,22 @@ void parseCompactLine(WiFiClient& client, char* line) {
       ax[a].stepCount = 0;
       ax[a].pos = 0.0f;
       ax[a].wco = 0.0f;
+      // N17: la posicion mecanica queda desconocida: exigir re-referenciado
+      ax[a].homed = false;
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
         plannedPos[a] = 0.0f; // A1r/N1: resincronizar bajo mutex
         xSemaphoreGive(stateMutex);
       }
       client.print("ACK|reset_step_counter|OK\n");
+      sendCompactStatus(client); // N17: la UI refleja la perdida de referencia
     }
     return;
   }
   if (strcmp(cmdName, "set_calibration_axis") == 0) {
     // A7r: la calibracion guarda steps/mm y fecha; el recorrido maximo es un
     // parametro aparte (set_travel_axis) y no se pisa con la distancia medida.
+    // N17: cambiar steps/mm invalida la referencia (pos/steps ya no significan
+    // lo mismo): se exige re-homing del eje.
     char* axStr = strtok(NULL, "|");
     char* spmStr = strtok(NULL, "|");
     char* distStr = strtok(NULL, "|"); // distancia medida (informativa, no se aplica)
@@ -1692,7 +1917,13 @@ void parseCompactLine(WiFiClient& client, char* line) {
       AxisId a = parseAxis(axStr);
       float spmVal = (float)atof(spmStr);
       if (spmVal < 0.1f || spmVal > 100000.0f) { client.print("ACK|set_calibration_axis|INVALID\n"); return; } // N6
+      bool spmChanged = fabsf(ax[a].stepsPerMm - spmVal) > 1e-6f;
       ax[a].stepsPerMm = spmVal;
+      if (spmChanged) {
+        // N17: re-referenciado obligatorio tras cambiar la calibracion
+        ax[a].homed = false;
+        strncpy(ax[a].lastError, "Re-Home req", sizeof(ax[a].lastError) - 1);
+      }
       if (dateStr) {
         strncpy(ax[a].lastCalibration, dateStr, sizeof(ax[a].lastCalibration) - 1);
         ax[a].lastCalibration[sizeof(ax[a].lastCalibration) - 1] = '\0';
@@ -1700,6 +1931,7 @@ void parseCompactLine(WiFiClient& client, char* line) {
       ax[a].calibrated = true;
       saveAxisNVS(a);
       client.print("ACK|set_calibration_axis|OK\n");
+      sendCompactStatus(client); // N17: la UI refleja la perdida de referencia
     }
     return;
   }
@@ -1915,8 +2147,13 @@ void parseSerialCommand(char* line) {
     return;
   }
   if (strncmp(line, "CMD|enable_actuators", 20) == 0) {
-    if (digitalRead(PIN_ESTOP) == LOW) {
+    if (estopActive()) {
       Serial.println("ACK|enable_actuators|REJECTED");
+      return;
+    }
+    // N12: misma politica que por TCP: purga total al salir de ALARM
+    if (machineState == ALARM && !clearAlarmState()) {
+      Serial.println("ACK|enable_actuators|FAIL");
       return;
     }
     setActuatorsState(true);
@@ -1955,10 +2192,11 @@ void setup(){
   pinMode(PIN_ENABLE_ACTUATORS, OUTPUT);
   setActuatorsState(false);
 
-  // C2: E-stop fisico con ISR (NC a GND, fail-safe: cable roto = activado)
+  // C2/N20: E-stop fisico con ISR. Boton NC a GND con INPUT_PULLUP: el estado
+  // ACTIVO (pulsado o cable cortado) es HIGH -> flanco RISING. Fail-safe real.
   pinMode(PIN_ESTOP, INPUT_PULLUP);
-  attachInterrupt(PIN_ESTOP, onEstopISR, FALLING);
-  if (digitalRead(PIN_ESTOP) == LOW) {
+  attachInterrupt(PIN_ESTOP, onEstopISR, RISING);
+  if (estopActive()) {
     estopTriggered = true;
     Serial.println("[E-STOP] Pulsado al arrancar: actuadores bloqueados");
   }
@@ -2019,8 +2257,12 @@ void loop(){
         tcpBufIdx = 0;
         clientWasConnected = true;
         clientAuthenticated = (authToken.length() == 0);
+        authFailCount = 0;                    // C5: limite de intentos por sesion
+        authGraceStartMs = millis();          // C5: plazo para autenticarse
         lastRxMs = millis();
         cl.setNoDelay(true);
+        // C2r: escrituras TCP acotadas: un cliente colgado no bloquea loop()
+        cl.setTimeout(TCP_WRITE_TIMEOUT_MS);
       } else {
         delay(2);
         return;
@@ -2029,6 +2271,14 @@ void loop(){
       delay(2);
       return;
     }
+  }
+
+  // C5: una sesion sin autenticar no puede ocupar el unico cupo para siempre
+  if (cl && cl.connected() && authToken.length() > 0 && !clientAuthenticated &&
+      (millis() - authGraceStartMs > AUTH_GRACE_MS)) {
+    cl.print("error:Auth timeout\n");
+    cl.stop();
+    return;
   }
 
   if (cl && cl.connected()) {
@@ -2053,26 +2303,39 @@ void loop(){
         cl.print("ok\r\n");
         continue;
       }
-      if (ch == (char)0x85) { // N5: Jog Cancel real: cancela solo bloques jog
+      if (ch == (char)0x85) { // N5/A1r: cancela solo bloques jog, sin tocar el
+        // resto del programa; plannedPos se resincroniza solo en los ejes cuyo
+        // jog fue cancelado (los demas bloques mantienen su planificacion).
         jogCancelEpoch++;
         for (int i = 0; i < AXIS_COUNT; i++) clearManualFlags((AxisId)i);
         if (machineState == MANUAL) machineState = IDLE;
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          // purga bloques jog pendientes sin tocar el resto del programa
+          // A1r: recalcular donde termina realmente la cola tras la
+          // cancelacion: replanificar las posiciones desde la posicion actual
+          // sumando solo los deltas de los bloques NO jog que quedan activos.
+          // plannedPos pasa a ser el objetivo del ultimo bloque no jog vivo
+          // (o la posicion actual si no queda ninguno). No se reescribe a
+          // ciegas con ax[].pos si quedaban movimientos de programa.
+          float replanned[AXIS_COUNT] = {ax[0].pos, ax[1].pos, ax[2].pos, ax[3].pos};
           int n = (qHead - qTail + BLOCK_QUEUE_SIZE) % BLOCK_QUEUE_SIZE;
-          int newTail = qTail;
           for (int k = 0; k < n; k++) {
             int idx = (qTail + k) % BLOCK_QUEUE_SIZE;
-            if (blockQueue[idx].active && blockQueue[idx].isJog) {
+            if (!blockQueue[idx].active) continue;
+            if (blockQueue[idx].isJog) {
               blockQueue[idx].active = false;
               blockQueue[idx].maxSteps = 0;
               blockQueue[idx].isDwell = true; // se ejecuta como dwell nulo
               blockQueue[idx].dwellMs = 0;
               for (int a = 0; a < AXIS_COUNT; a++) blockQueue[idx].deltaSteps[a] = 0;
+              continue; // no aporta desplazamiento
+            }
+            // bloque no jog: acumula el desplazamiento eje a eje
+            for (int a = 0; a < AXIS_COUNT; a++) {
+              float dmm = (float)blockQueue[idx].deltaSteps[a] / safeSpm((AxisId)a);
+              replanned[a] += blockQueue[idx].dirPos[a] ? dmm : -dmm;
             }
           }
-          (void)newTail;
-          for (int a = 0; a < AXIS_COUNT; a++) plannedPos[a] = ax[a].pos;
+          for (int a = 0; a < AXIS_COUNT; a++) plannedPos[a] = replanned[a];
           xSemaphoreGive(stateMutex);
         }
         continue;
